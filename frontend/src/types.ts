@@ -24,6 +24,16 @@ export type ScanSnapshot = {
   areas: DiscArea[];
   tracks: DiscTrack[];
   dst: boolean;
+  artwork: {
+    filename: string;
+    sourceName: string;
+    generated: boolean;
+    selectedAutomatically: boolean;
+    width: number;
+    height: number;
+    url: string;
+    version: number;
+  };
 };
 
 export type Health = {

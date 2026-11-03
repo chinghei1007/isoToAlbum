@@ -65,6 +65,10 @@ for title in 'So What' 'Freddie Freeloader' 'Blue in Green'; do
   number=$(printf '%02d' "$track")
   if [ "$format" = 'flac' ]; then
     ffmpeg -hide_banner -loglevel error -f lavfi -i 'anullsrc=r=44100:cl=stereo' -t 0.05 -ar "$pcm_rate" -c:a flac "$album_dir/$number - $title.flac"
+  elif [ "$format" = 'dsf' ]; then
+    # Minimal DSF header for metadata-only integration tests. The production
+    # extractor writes the real DSD audio and format/data chunks.
+    printf 'DSD \034\000\000\000\000\000\000\000\034\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000' > "$album_dir/$number - $title.dsf"
   else
     printf 'mock %s audio\n' "$format" > "$album_dir/$number - $title.$format"
   fi

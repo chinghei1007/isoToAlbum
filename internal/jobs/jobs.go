@@ -13,18 +13,31 @@ import (
 	"strings"
 	"sync"
 
+	"isotoalbum/internal/artwork"
 	"isotoalbum/internal/sacd"
 )
 
+type ArtworkSnapshot struct {
+	Filename              string `json:"filename"`
+	SourceName            string `json:"sourceName"`
+	Generated             bool   `json:"generated"`
+	SelectedAutomatically bool   `json:"selectedAutomatically"`
+	Width                 int    `json:"width"`
+	Height                int    `json:"height"`
+	URL                   string `json:"url"`
+	Version               int    `json:"version"`
+}
+
 type ScanSnapshot struct {
-	ID       string       `json:"id"`
-	Filename string       `json:"filename"`
-	Size     int64        `json:"size"`
-	Album    string       `json:"album"`
-	Artist   string       `json:"artist"`
-	Areas    []sacd.Area  `json:"areas"`
-	Tracks   []sacd.Track `json:"tracks"`
-	DST      bool         `json:"dst"`
+	ID       string          `json:"id"`
+	Filename string          `json:"filename"`
+	Size     int64           `json:"size"`
+	Album    string          `json:"album"`
+	Artist   string          `json:"artist"`
+	Areas    []sacd.Area     `json:"areas"`
+	Tracks   []sacd.Track    `json:"tracks"`
+	DST      bool            `json:"dst"`
+	Artwork  ArtworkSnapshot `json:"artwork"`
 }
 
 type Manifest struct {
@@ -58,12 +71,15 @@ type Snapshot struct {
 }
 
 type scan struct {
-	id       string
-	filename string
-	size     int64
-	tempDir  string
-	input    string
-	info     sacd.DiscInfo
+	mu          sync.RWMutex
+	id          string
+	filename    string
+	size        int64
+	tempDir     string
+	input       string
+	info        sacd.DiscInfo
+	artworkPath string
+	artwork     ArtworkSnapshot
 }
 
 type job struct {
@@ -96,7 +112,7 @@ func NewManager(tool *sacd.Tool, projectRoot string) *Manager {
 	return &Manager{scans: map[string]*scan{}, jobs: map[string]*job{}, tool: tool, projectRoot: projectRoot}
 }
 
-func (m *Manager) Inspect(ctx context.Context, tempDir, input, filename string, size int64) (ScanSnapshot, error) {
+func (m *Manager) Inspect(ctx context.Context, tempDir, input, filename string, size int64, artworkName string, artworkSource io.Reader) (ScanSnapshot, error) {
 	info, err := m.tool.Inspect(ctx, input)
 	if err != nil {
 		return ScanSnapshot{}, err
@@ -105,7 +121,23 @@ func (m *Manager) Inspect(ctx context.Context, tempDir, input, filename string, 
 	if err != nil {
 		return ScanSnapshot{}, err
 	}
-	item := &scan{id: id, filename: filename, size: size, tempDir: tempDir, input: input, info: info}
+	coverPath := filepath.Join(tempDir, "cover.jpg")
+	details := artwork.Details{}
+	generated := artworkSource == nil
+	if generated {
+		details, err = artwork.Generate(info.Album, info.Artist, coverPath)
+		artworkName = "Generated title cover"
+	} else {
+		details, err = artwork.Normalize(artworkSource, coverPath)
+		artworkName = filepath.Base(artworkName)
+	}
+	if err != nil {
+		return ScanSnapshot{}, err
+	}
+	item := &scan{
+		id: id, filename: filename, size: size, tempDir: tempDir, input: input, info: info, artworkPath: coverPath,
+		artwork: ArtworkSnapshot{Filename: "cover.jpg", SourceName: artworkName, Generated: generated, SelectedAutomatically: !generated, Width: details.Width, Height: details.Height, URL: "/api/scans/" + id + "/artwork", Version: 1},
+	}
 	m.mu.Lock()
 	m.scans[id] = item
 	m.mu.Unlock()
@@ -113,7 +145,43 @@ func (m *Manager) Inspect(ctx context.Context, tempDir, input, filename string, 
 }
 
 func (s *scan) snapshot() ScanSnapshot {
-	return ScanSnapshot{ID: s.id, Filename: s.filename, Size: s.size, Album: s.info.Album, Artist: s.info.Artist, Areas: append([]sacd.Area(nil), s.info.Areas...), Tracks: append([]sacd.Track(nil), s.info.Tracks...), DST: s.info.DST}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return ScanSnapshot{ID: s.id, Filename: s.filename, Size: s.size, Album: s.info.Album, Artist: s.info.Artist, Areas: append([]sacd.Area(nil), s.info.Areas...), Tracks: append([]sacd.Track(nil), s.info.Tracks...), DST: s.info.DST, Artwork: s.artwork}
+}
+
+func (m *Manager) UpdateArtwork(id, filename string, source io.Reader) (ScanSnapshot, error) {
+	m.mu.RLock()
+	item, ok := m.scans[id]
+	m.mu.RUnlock()
+	if !ok {
+		return ScanSnapshot{}, fmt.Errorf("the scanned ISO is no longer available; choose it again")
+	}
+	details, err := artwork.Normalize(source, item.artworkPath)
+	if err != nil {
+		return ScanSnapshot{}, err
+	}
+	item.mu.Lock()
+	item.artwork.SourceName = filepath.Base(filename)
+	item.artwork.Generated = false
+	item.artwork.SelectedAutomatically = false
+	item.artwork.Width = details.Width
+	item.artwork.Height = details.Height
+	item.artwork.Version++
+	item.mu.Unlock()
+	return item.snapshot(), nil
+}
+
+func (m *Manager) Artwork(id string) (string, string, bool) {
+	m.mu.RLock()
+	item, ok := m.scans[id]
+	m.mu.RUnlock()
+	if !ok {
+		return "", "", false
+	}
+	item.mu.RLock()
+	defer item.mu.RUnlock()
+	return item.artworkPath, item.artwork.Filename, true
 }
 
 func (m *Manager) Create(manifest Manifest) (Snapshot, error) {
@@ -231,6 +299,33 @@ func (m *Manager) process(item *job) {
 				item.message = fmt.Sprintf("Writing WAV %d of %d: %s", current, total, name)
 			})
 		}); err != nil {
+			item.fail(err)
+			return
+		}
+	}
+
+	item.update(func() {
+		item.stage = "artwork"
+		item.progress = 0.96
+		item.message = "Applying the canonical album artwork."
+	})
+	coverPath, _, ok := m.Artwork(item.scan.id)
+	if !ok {
+		item.fail(fmt.Errorf("the canonical album artwork is no longer available"))
+		return
+	}
+	if err := artwork.CopyToAlbumFolders(filesDir, coverPath); err != nil {
+		item.fail(err)
+		return
+	}
+	switch item.manifest.Format {
+	case "dsf":
+		if err := artwork.EmbedDSFFolder(filesDir, coverPath); err != nil {
+			item.fail(err)
+			return
+		}
+	case "flac":
+		if err := artwork.EmbedFLACFolder(context.Background(), m.tool.FFmpegPath, filesDir, coverPath); err != nil {
 			item.fail(err)
 			return
 		}

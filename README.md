@@ -1,6 +1,6 @@
 # ISO to Album
 
-ISO to Album is a local, single-port web application for turning a readable SACD ISO into per-track audio files. Its Go server scans and extracts the disc with `sacd_extract`, serves an embedded Vite/React interface, and optionally uses FFmpeg to wrap the extracted 24-bit PCM as WAV.
+ISO to Album is a local, single-port web application for turning a readable SACD ISO into per-track audio files. Its Go server scans and extracts the disc with `sacd_extract`, serves an embedded Vite/React interface, and uses FFmpeg for WAV conversion and lossless FLAC artwork attachment.
 
 The interface follows the same quiet, powder-blue design language as the sibling `cueSplitter` project.
 
@@ -23,7 +23,7 @@ Build dependencies:
 Runtime dependencies:
 
 - A current `sacd_extract` build with `--dsf`, `--dsdiff`, `--flac`, and `--flac-rate` support. This project targets [dev-zetta/sacd_extract2](https://github.com/dev-zetta/sacd_extract2).
-- FFmpeg for WAV output. DSF, DFF, and FLAC do not require FFmpeg.
+- FFmpeg for WAV output and FLAC artwork embedding. DSF and DFF do not require FFmpeg.
 
 Check the environment:
 
@@ -59,11 +59,12 @@ Vite proxies `/api` to the Go server on port 8080 only when configured there; fo
 
 ## Workflow
 
-1. Choose one readable SACD `.iso` file. The browser uploads it to the local Go process.
-2. The server runs `sacd_extract --info` and displays album, area, encoding, and track metadata.
-3. Choose DSF, DFF, WAV, or FLAC; stereo is selected when present. Multichannel and combined exports appear only when the ISO contains those areas.
-4. Choose Browser Downloads, the project `output/` directory, or another server path.
-5. Start the job and follow per-track progress. Browser output is delivered as a ZIP containing the extracted album and a UTF-8 `tracklist.txt`.
+1. Choose a folder or files containing exactly one readable SACD `.iso` and, optionally, JPG, PNG, or WebP artwork. When several images are present, common names such as `cover`, `folder`, `front`, and `album` are preferred.
+2. The server runs `sacd_extract --info`, displays the disc metadata, and normalizes the selected image to an RGB `cover.jpg` no larger than 1000 px. If no image is supplied, it generates a title cover from the album and artist metadata.
+3. Review the canonical cover or replace it before export.
+4. Choose DSF, DFF, WAV, or FLAC; stereo is selected when present. Multichannel and combined exports appear only when the ISO contains those areas.
+5. Choose Browser Downloads, the project `output/` directory, or another server path.
+6. Start the job and follow per-track progress. Browser output is delivered as a ZIP containing the extracted album, `cover.jpg`, and a UTF-8 `tracklist.txt`. The same Front Cover is embedded in DSF and FLAC tracks without re-encoding their audio; DFF and WAV use the folder cover.
 
 The upload is local but still copies the ISO into a temporary server directory. Temporary scan and job directories last for the lifetime of the server process and the operating system's normal temporary-file cleanup.
 

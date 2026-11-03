@@ -34,6 +34,8 @@ func New(manager *jobs.Manager, tool *sacd.Tool) (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", service.health)
 	mux.HandleFunc("POST /api/scans", service.createScan)
+	mux.HandleFunc("GET /api/scans/{id}/artwork", service.scanArtwork)
+	mux.HandleFunc("POST /api/scans/{id}/artwork", service.replaceArtwork)
 	mux.HandleFunc("POST /api/jobs", service.createJob)
 	mux.HandleFunc("GET /api/jobs/{id}", service.jobStatus)
 	mux.HandleFunc("GET /api/jobs/{id}/events", service.jobEvents)
@@ -74,6 +76,11 @@ func (a *api) createScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "The selected file must have the .iso extension.")
 		return
 	}
+	artworkFiles := r.MultipartForm.File["artwork"]
+	if len(artworkFiles) > 1 {
+		writeError(w, http.StatusBadRequest, "Choose at most one album image.")
+		return
+	}
 	tempDir, err := os.MkdirTemp("", "iso-to-album-scan-*")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Could not create a temporary scan folder.")
@@ -104,13 +111,71 @@ func (a *api) createScan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Could not finish saving the ISO.")
 		return
 	}
-	snapshot, err := a.manager.Inspect(r.Context(), tempDir, inputPath, filename, size)
+	var artworkName string
+	var artworkInput io.ReadCloser
+	if len(artworkFiles) == 1 {
+		artworkName = filepath.Base(artworkFiles[0].Filename)
+		if !supportedArtworkName(artworkName) {
+			writeError(w, http.StatusBadRequest, "The album image must be a JPG, PNG, or WebP file.")
+			return
+		}
+		artworkInput, err = artworkFiles[0].Open()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "Could not read the selected album image.")
+			return
+		}
+		defer artworkInput.Close()
+	}
+	snapshot, err := a.manager.Inspect(r.Context(), tempDir, inputPath, filename, size, artworkName, artworkInput)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	keep = true
 	writeJSON(w, http.StatusCreated, snapshot)
+}
+
+func (a *api) scanArtwork(w http.ResponseWriter, r *http.Request) {
+	filePath, filename, ok := a.manager.Artwork(r.PathValue("id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "Artwork not found.")
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": filename}))
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, filePath)
+}
+
+func (a *api) replaceArtwork(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 26<<20)
+	if err := r.ParseMultipartForm(2 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "Could not read the album image: "+err.Error())
+		return
+	}
+	defer r.MultipartForm.RemoveAll()
+	files := r.MultipartForm.File["artwork"]
+	if len(files) != 1 {
+		writeError(w, http.StatusBadRequest, "Choose exactly one album image.")
+		return
+	}
+	filename := filepath.Base(files[0].Filename)
+	if !supportedArtworkName(filename) {
+		writeError(w, http.StatusBadRequest, "The album image must be a JPG, PNG, or WebP file.")
+		return
+	}
+	input, err := files[0].Open()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Could not read the selected album image.")
+		return
+	}
+	defer input.Close()
+	snapshot, err := a.manager.UpdateArtwork(r.PathValue("id"), filename, input)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
 }
 
 func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
@@ -122,8 +187,8 @@ func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, ffmpeg := a.tool.Available()
-	if manifest.Format == "wav" && !ffmpeg {
-		writeError(w, http.StatusServiceUnavailable, "FFmpeg is required for WAV output.")
+	if (manifest.Format == "wav" || manifest.Format == "flac") && !ffmpeg {
+		writeError(w, http.StatusServiceUnavailable, "FFmpeg is required for WAV conversion and FLAC artwork embedding.")
 		return
 	}
 	snapshot, err := a.manager.Create(manifest)
@@ -132,6 +197,15 @@ func (a *api) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, snapshot)
+}
+
+func supportedArtworkName(filename string) bool {
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".jpg", ".jpeg", ".png", ".webp":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *api) jobStatus(w http.ResponseWriter, r *http.Request) {

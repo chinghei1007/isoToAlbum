@@ -36,6 +36,27 @@ function formatName(format: ExportFormat) {
   return format.toUpperCase();
 }
 
+const imageExtensions = [".jpg", ".jpeg", ".png", ".webp"];
+const preferredArtworkNames = ["cover", "folder", "front", "album"];
+const directoryInputProps = { webkitdirectory: "", directory: "" };
+
+function extension(filename: string) {
+  const index = filename.lastIndexOf(".");
+  return index >= 0 ? filename.slice(index).toLowerCase() : "";
+}
+
+function artworkRank(file: File) {
+  const name = file.name.slice(0, Math.max(0, file.name.lastIndexOf("."))).toLowerCase();
+  const preferred = preferredArtworkNames.indexOf(name);
+  return preferred >= 0 ? preferred : preferredArtworkNames.length;
+}
+
+function chooseArtwork(files: File[]) {
+  return files
+    .filter((file) => imageExtensions.includes(extension(file.name)))
+    .sort((left, right) => artworkRank(left) - artworkRank(right) || left.name.localeCompare(right.name))[0];
+}
+
 export default function App() {
   const [health, setHealth] = useState<Health>();
   const [phase, setPhase] = useState<Phase>("ready");
@@ -45,7 +66,10 @@ export default function App() {
   const [job, setJob] = useState<JobSnapshot>();
   const [message, setMessage] = useState("");
   const [dragging, setDragging] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [artworkBusy, setArtworkBusy] = useState(false);
+  const filesInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+  const artworkInputRef = useRef<HTMLInputElement>(null);
   const eventsRef = useRef<EventSource | null>(null);
   const downloadStartedRef = useRef(false);
 
@@ -57,14 +81,14 @@ export default function App() {
     return () => eventsRef.current?.close();
   }, []);
 
-  const busy = phase === "scanning" || phase === "processing";
+  const busy = phase === "scanning" || phase === "processing" || artworkBusy;
   const hasStereo = scan?.areas.some((area) => area.id === "stereo") ?? false;
   const hasMultichannel = scan?.areas.some((area) => area.id === "multichannel") ?? false;
   const pcm = settings.format === "wav" || settings.format === "flac";
   const errors = useMemo(() => {
     const items: string[] = [];
     if (health && !health.sacdExtract) items.push("sacd_extract is required to read SACD ISO files.");
-    if (health && !health.ffmpeg && settings.format === "wav") items.push("FFmpeg is required for WAV output.");
+    if (health && !health.ffmpeg && (settings.format === "wav" || settings.format === "flac")) items.push("FFmpeg is required for WAV conversion and FLAC artwork embedding.");
     if (settings.destination === "custom" && !settings.destinationPath.trim()) items.push("Enter the other server output path.");
     return items;
   }, [health, settings.destination, settings.destinationPath, settings.format]);
@@ -76,21 +100,28 @@ export default function App() {
     setJob(undefined);
     setMessage("");
     setUploadProgress(0);
+    setArtworkBusy(false);
     setSettings(initialSettings);
     downloadStartedRef.current = false;
-    if (inputRef.current) inputRef.current.value = "";
+    if (filesInputRef.current) filesInputRef.current.value = "";
+    if (folderInputRef.current) folderInputRef.current.value = "";
+    if (artworkInputRef.current) artworkInputRef.current.value = "";
   }
 
-  function acceptFile(file?: File) {
-    if (!file || busy) return;
-    if (!file.name.toLowerCase().endsWith(".iso")) {
+  function acceptFiles(source?: FileList | File[]) {
+    if (!source || busy) return;
+    const files = Array.from(source);
+    const isoFiles = files.filter((file) => extension(file.name) === ".iso");
+    if (isoFiles.length !== 1) {
       setPhase("error");
-      setMessage("Choose a SACD image with the .iso extension.");
+      setMessage("Choose exactly one SACD image with the .iso extension.");
       return;
     }
+    const file = isoFiles[0];
+    const artwork = chooseArtwork(files);
     eventsRef.current?.close();
     setPhase("scanning");
-    setMessage("Uploading the ISO to the local server for a table-of-contents scan.");
+    setMessage(artwork ? `Uploading the ISO and ${artwork.name} for a table-of-contents scan.` : "Uploading the ISO; a title cover will be generated after the scan.");
     setUploadProgress(0);
     setScan(undefined);
     setJob(undefined);
@@ -98,6 +129,7 @@ export default function App() {
 
     const body = new FormData();
     body.append("iso", file, file.name);
+    if (artwork) body.append("artwork", artwork, artwork.name);
     const request = new XMLHttpRequest();
     request.open("POST", "/api/scans");
     request.upload.onprogress = (event) => {
@@ -129,6 +161,33 @@ export default function App() {
       setMessage("");
     };
     request.send(body);
+  }
+
+  async function replaceArtwork(file?: File) {
+    if (!file || !scan || busy) return;
+    if (!imageExtensions.includes(extension(file.name))) {
+      setPhase("error");
+      setMessage("Choose a JPG, PNG, or WebP album image.");
+      return;
+    }
+    setArtworkBusy(true);
+    setMessage(`Normalizing ${file.name} as the canonical album cover.`);
+    const body = new FormData();
+    body.append("artwork", file, file.name);
+    try {
+      const response = await fetch(`/api/scans/${scan.id}/artwork`, { method: "POST", body });
+      const value = await response.json() as ScanSnapshot | { error?: string };
+      if (!response.ok || !("id" in value)) throw new Error(("error" in value ? value.error : undefined) || `The server rejected the image (${response.status}).`);
+      setScan(value);
+      setPhase("scanned");
+      setMessage("");
+    } catch (error) {
+      setPhase("error");
+      setMessage(error instanceof Error ? error.message : "Could not replace the album artwork.");
+    } finally {
+      setArtworkBusy(false);
+      if (artworkInputRef.current) artworkInputRef.current.value = "";
+    }
   }
 
   function applyJob(next: JobSnapshot) {
@@ -210,21 +269,32 @@ export default function App() {
         onDrop={(event) => {
           event.preventDefault();
           setDragging(false);
-          acceptFile(event.dataTransfer.files[0]);
+          acceptFiles(event.dataTransfer.files);
         }}
       >
-        <p>Drop one SACD .iso file here</p>
+        <p>Drop one SACD .iso with an optional album image</p>
         <div className="drop-actions">
-          <button type="button" disabled={busy} onClick={() => inputRef.current?.click()}>Choose ISO</button>
-          <span>or drop it anywhere in this box</span>
+          <button type="button" disabled={busy} onClick={() => folderInputRef.current?.click()}>Choose folder</button>
+          <span>or</span>
+          <button type="button" disabled={busy} onClick={() => filesInputRef.current?.click()}>Choose files</button>
         </div>
         <input
-          ref={inputRef}
+          ref={folderInputRef}
           className="visually-hidden"
           type="file"
-          accept=".iso,application/octet-stream"
+          multiple
+          {...directoryInputProps}
           disabled={busy}
-          onChange={(event) => acceptFile(event.currentTarget.files?.[0])}
+          onChange={(event) => acceptFiles(event.currentTarget.files ?? undefined)}
+        />
+        <input
+          ref={filesInputRef}
+          className="visually-hidden"
+          type="file"
+          multiple
+          accept=".iso,.jpg,.jpeg,.png,.webp,application/octet-stream,image/jpeg,image/png,image/webp"
+          disabled={busy}
+          onChange={(event) => acceptFiles(event.currentTarget.files ?? undefined)}
         />
       </div>
 
@@ -242,6 +312,13 @@ export default function App() {
           <div className="rows">
             <div className="input-row"><span>Source</span><span>{scan.filename}</span><span>{formatBytes(scan.size)}</span></div>
             <div className="input-row"><span>Album</span><span>{scan.album}{scan.artist ? ` · ${scan.artist}` : ""}</span><span>{scan.tracks.length} tracks</span></div>
+            <div className="artwork-row">
+              <span>Artwork</span>
+              <img src={`${scan.artwork.url}?v=${scan.artwork.version}`} alt={`Album cover for ${scan.album}`} />
+              <span className="artwork-details"><strong>{scan.artwork.filename}</strong><small>{scan.artwork.generated ? "Generated from album title and artist" : scan.artwork.selectedAutomatically ? `Selected automatically from ${scan.artwork.sourceName}` : `Replaced with ${scan.artwork.sourceName}`} · normalized RGB JPEG · {scan.artwork.width}×{scan.artwork.height}</small></span>
+              <button type="button" className="quiet-button" disabled={busy} onClick={() => artworkInputRef.current?.click()}>{artworkBusy ? "Replacing" : "Replace"}</button>
+              <input ref={artworkInputRef} className="visually-hidden" type="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" disabled={busy} onChange={(event) => replaceArtwork(event.currentTarget.files?.[0])} />
+            </div>
             <div className="input-row"><span>Areas</span><span>{scan.areas.map((area) => `${area.label} · ${area.encoding}`).join(" · ")}</span><span>{scan.dst ? "DST present" : "Uncompressed DSD"}</span></div>
           </div>
         </section>
@@ -294,6 +371,7 @@ export default function App() {
           {settings.destination === "project" && <p className="quiet-note">Tracks will be written under <code>output/&lt;album-name&gt;</code> in the server working directory.</p>}
 
           <div className="format-note">
+            <p><strong>Artwork:</strong> <code>cover.jpg</code> is placed with the album. The same Front Cover is embedded into every DSF and FLAC track; DFF and WAV use the folder cover.</p>
             <p><strong>DSF:</strong> native DSD with lossless DST decompression when required; usually the safest portable-player choice.</p>
             <p><strong>DFF:</strong> native DSDIFF. Optional DST preservation saves space but needs player-side DST decoding.</p>
             <p><strong>WAV / FLAC:</strong> lossless 24-bit PCM files. DSD-to-PCM conversion is irreversible, so keep the ISO or DSF/DFF for DSD-level archiving.</p>
